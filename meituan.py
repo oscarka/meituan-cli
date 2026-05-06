@@ -115,8 +115,33 @@ def go_to_waimai() -> bool:
 
 # --- 搜索 ---
 
+import json as _json
+_CACHE_FILE = "/tmp/meituan_last_results.json"
+
 # 模块级结果缓存（search_restaurants / list_food_channel 返回后存入）
 _last_results: List[Dict] = []
+
+
+def _save_results(results: List[Dict]):
+    """把搜索结果持久化到磁盘，供下次 CLI 调用读取。"""
+    global _last_results
+    _last_results = results
+    try:
+        with open(_CACHE_FILE, "w", encoding="utf-8") as f:
+            _json.dump(results, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _load_results() -> List[Dict]:
+    """优先用内存缓存，内存为空时从磁盘恢复。"""
+    if _last_results:
+        return _last_results
+    try:
+        with open(_CACHE_FILE, "r", encoding="utf-8") as f:
+            return _json.load(f)
+    except Exception:
+        return []
 
 def search_restaurants(keyword: str, max_screens: int = 5) -> List[Dict]:
     """
@@ -213,8 +238,7 @@ def search_restaurants(keyword: str, max_screens: int = 5) -> List[Dict]:
     results = _collect_restaurants_with_scroll(_ud, max_screens=max_screens)
     if not results:
         results = _parse_restaurant_list(dump_screen())
-    global _last_results
-    _last_results = results
+    _save_results(results)
     return results
 
 
@@ -481,11 +505,12 @@ def open_restaurant(name_or_idx) -> bool:
 
     # ---- MRN 页面（美食频道 / 搜索结果）----
     if is_mrn:
-        # 优先用缓存（避免滚动后 index 错位）
-        cache = _last_results
+        # 优先用磁盘/内存缓存（避免进程间 index 错位）
+        cache = _load_results()
         if isinstance(name_or_idx, int):
             if cache and name_or_idx < len(cache):
                 target_name = cache[name_or_idx]["name"]
+                print(f"  [open] 从缓存读取: [{name_or_idx}] {target_name}")
             else:
                 # 没缓存则滚到顶部重新解析
                 _ud.swipe(540, 800, 540, 2000, duration=0.4)
@@ -502,12 +527,23 @@ def open_restaurant(name_or_idx) -> bool:
         for _scroll_try in range(6):
             tv_el = _ud.xpath(f'//android.widget.TextView[@text="{target_name}"]')
             if tv_el.exists:
-                break
+                info = tv_el.info
+                bounds = info.get("bounds", {})
+                cy = (bounds.get("top", 0) + bounds.get("bottom", 0)) // 2
+                if 350 < cy < 2200:
+                    break
             _ud.swipe(540, 600, 540, 2100, duration=0.5)  # 手指往下，内容向上滚回
             time.sleep(1.2)
 
         if tv_el.exists:
-            tv_el.click()
+            # 再次确认坐标，避免点击屏幕外的元素
+            info = tv_el.info
+            bounds = info.get("bounds", {})
+            cy = (bounds.get("top", 0) + bounds.get("bottom", 0)) // 2
+            if 350 < cy < 2200:
+                tv_el.click()
+            else:
+                _ud.click(540, cy) # 尽力点击
             time.sleep(3)
             new_focus = _get_focus()
             # 判断进店成功：Activity 变了（其他 Activity）或者页面内容变成餐厅详情
@@ -732,9 +768,11 @@ def add_to_cart(item_name: str) -> bool:
 
     els = dump_screen()
 
-    # 找到菜品 TextView
     target_el = None
+    # 找到菜品 TextView (排除顶部的搜索框, 搜索框 cy 通常 < 250)
     for el in els:
+        if el.get("cy", 0) < 250:
+            continue
         t = (el.get("text") or "").strip()
         if item_name in t and len(t) <= len(item_name) + 10:
             target_el = el
@@ -751,36 +789,59 @@ def add_to_cart(item_name: str) -> bool:
 
     cy = target_el["cy"]
 
-    # 策略1：同行/下方找 clickable 的「+」或「加入购物车」按钮
-    nearby_clickable = [
+    # 策略1：找到标题下方最近的「加购/选规格」按钮
+    valid_btns = [
         e for e in els
-        if abs(e.get("cy", 0) - cy) < 100
-        and e.get("clickable")
-        and e.get("cx", 0) > 600  # 右侧
+        if e.get("cy", 0) > cy - 50
+        and e.get("cx", 0) > 600
     ]
-    for n in nearby_clickable:
+    
+    clicked = False
+    add_btn = None
+    for n in sorted(valid_btns, key=lambda x: x.get("cy", 0)):
         t = (n.get("text") or "").strip()
         nid = (n.get("id") or "").lower()
-        if t in ("+", "加入") or "加入购物车" in t or "add" in nid or "plus" in nid:
-            u2_tap(n["cx"], n["cy"])
-            time.sleep(0.8)
-            return True
+        if t in ("+", "加入", "选规格", "选套餐") or "加入购物车" in t or "add" in nid or "plus" in nid:
+            add_btn = n
+            break
 
-    # 策略2：用 uiautomator2 xpath 找菜品名旁边的加购按钮
-    item_safe = item_name.replace('"', '\"')
-    btn = _ud.xpath(
-        f'//*[contains(@text, "{item_safe}")]'
-        f'/following-sibling::*[@clickable="true"]'
-    )
-    if btn.exists:
-        btn.click()
-        time.sleep(0.8)
+    if add_btn:
+        u2_tap(add_btn["cx"], add_btn["cy"])
+        time.sleep(1.0)
+        clicked = True
+    else:
+        # 策略2：用 uiautomator2 xpath 找菜品名旁边的加购按钮
+        item_safe = item_name.replace('"', '\"')
+        btn = _ud.xpath(
+            f'//*[contains(@text, "{item_safe}")]'
+            f'/following-sibling::*[@clickable="true"]'
+        )
+        if btn.exists:
+            btn.click()
+            time.sleep(1.0)
+            clicked = True
+        else:
+            # 策略3：点击屏幕右侧对应高度的区域 (假设按钮在最右侧，稍微往下偏移以应对副标题)
+            u2_tap(950, cy + 100)
+            time.sleep(1.0)
+            clicked = True
+            
+    if clicked:
+        # 很多时候点击 + 号会弹出一个详情或者规格选择弹窗，里面需要再次点击「加入购物车」或「选好了」
+        time.sleep(1.5)  # 等待弹窗动画
+        confirm_btn = _ud(textMatches="加入购物车|选好了")
+        if confirm_btn.exists:
+            confirm_btn.click()
+            time.sleep(1.5)
+            
+        # 如果点击后弹窗仍未关闭（比如瑞幸允许多次加购不同规格，按钮变成 - 1 +），通过寻找关闭按钮来关闭它
+        close_btn = _ud(descriptionContains="关闭")
+        if close_btn.exists:
+            close_btn.click()
+            time.sleep(1.0)
         return True
 
-    # 策略3：点击菜品名右侧固定偏移
-    u2_tap(target_el["cx"] + 280, cy)
-    time.sleep(0.8)
-    return True
+    return False
 
 
 # --- 购物车 ---
@@ -859,9 +920,9 @@ def go_to_checkout() -> Dict:
         time.sleep(1.2)
         els = dump_screen()
 
-    # Step 2: 检测「差X元起送」情况
+    # Step 2: 检测「差X元起送」或「未点必选品」情况
     all_texts = " ".join((e.get("text") or "") for e in els)
-    m_min = re.search(r"还差[¥￥]?(\d+(?:\.\d+)?)元|差(\d+(?:\.\d+)?)元起送|再加\s*(\d+(?:\.\d+)?)", all_texts)
+    m_min = re.search(r"还差[¥￥]?\s*(\d+(?:\.\d+)?)\s*[元]?|差[¥￥]?\s*(\d+(?:\.\d+)?)\s*[元]?起送|再加\s*[¥￥]?\s*(\d+(?:\.\d+)?)", all_texts)
     if m_min:
         gap = next(v for v in m_min.groups() if v is not None)
         return {
@@ -870,12 +931,25 @@ def go_to_checkout() -> Dict:
             "gap": float(gap),
             "suggestion": f"继续调用 /add_to_cart?item=XX 加菜，需再加 ¥{gap} 才能结算",
         }
+        
+    if "未点必选品" in all_texts:
+        return {
+            "ok": False,
+            "error": "无法结算：未点必选品",
+            "suggestion": "该餐厅有必选商品（如打包费、必选小菜等），请手动或通过加购必选品后重试",
+        }
 
     # Step 3: 点击「去结算」
     for keyword in ["去结算", "结算", "确认订单", "提交订单"]:
         if tap_element(els, keyword):
             time.sleep(3)
             break
+    else:
+        # 如果循环正常结束（未触发 break，即没点到去结算）
+        return {
+            "ok": False,
+            "error": "未找到去结算按钮，可能是购物车为空或者有未满足的条件",
+        }
 
     # Step 4: 读取结算页信息
     els = dump_screen()

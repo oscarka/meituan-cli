@@ -184,8 +184,11 @@ def cmd_cart(args):
 
 def cmd_checkout(args):
     """去结算（停在确认订单页，不自动付款）"""
-    ok = meituan.go_to_checkout()
-    _out(args, {"ok": ok, "message": "已进入结算页，请在手机上确认付款" if ok else "未找到结算按钮"})
+    res = meituan.go_to_checkout()
+    if isinstance(res, dict) and not res.get("ok"):
+        _out(args, res)
+    else:
+        _out(args, {"ok": True, "message": "已进入结算页，请在手机上确认付款", **(res if isinstance(res, dict) else {})})
 
 
 def cmd_tap(args):

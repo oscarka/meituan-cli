@@ -303,10 +303,28 @@ def wait_for_main_screen(timeout: float = 15.0) -> bool:
     return False
 
 
+def keep_screen_on():
+    """
+    在自动化期间保持屏幕常亮：
+    1. 插电时始终保持屏幕亮（stay_on_while_plugged_in = 3）
+    2. 将屏幕超时延长至 10 分钟，防止操作中途熄屏
+    """
+    _adb("settings", "put", "global", "stay_on_while_plugged_in", "3")
+    _adb("settings", "put", "system", "screen_off_timeout", "600000")
+    # 如果屏幕已经关闭，唤醒它
+    _adb("input", "keyevent", "KEYCODE_WAKEUP")
+    time.sleep(0.3)
+
+
 def launch_meituan():
-    """启动美团 App"""
+    """强制冷启动美团 App，确保从干净的主页开始（同时保持屏幕常亮）"""
+    keep_screen_on()
+    # 先强制停止，清除返回栈，避免恢复到上次中断的页面
+    subprocess.run(["adb", "shell", "am", "force-stop", "com.sankuai.meituan"],
+                   capture_output=True)
+    time.sleep(1)
     subprocess.run([
         "adb", "shell", "am", "start", "-n",
         "com.sankuai.meituan/com.meituan.android.pt.homepage.activity.MainActivity"
     ], capture_output=True)
-    time.sleep(3)
+    time.sleep(4)
